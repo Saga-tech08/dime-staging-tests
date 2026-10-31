@@ -3,7 +3,10 @@ const { test, expect } = require('@playwright/test');
 const HOME_URL =
   'https://ctgovexec.sharepoint.com/sites/DOT-DIME-Test/SitePages/Home.aspx';
 
-// Opens the site (retries up to 3 times) and waits for the blue menu
+// Statuses seen so far (most specific first)
+const KNOWN_STATUSES = ['Initial Review Complete', 'Revision Needed', 'Approved', 'Submitted'];
+
+// Opens the site (retries up to 3 times) and waits until the app is ready
 async function openSite(page) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -17,25 +20,76 @@ async function openSite(page) {
   }
   await expect(page.getByText('Home', { exact: true }).first())
     .toBeVisible({ timeout: 90000 });
+  // wait for the first grid, so the app can respond to clicks
+  await page.getByText('STATUS').first()
+    .waitFor({ state: 'visible', timeout: 90000 }).catch(() => {});
+  await page.waitForTimeout(3000);
 }
 
-// Clicks one item in the blue menu.
-// section = 'REPORTING' or 'ADMIN' for items inside those groups.
-async function clickMenu(page, name, section) {
-  if (section) {
-    const firstItem = section === 'REPORTING' ? 'By Contracts' : 'Add / Update User';
-    const visible = await page.getByText(firstItem, { exact: true }).first().isVisible();
-    if (!visible) {
-      await page.getByText(section, { exact: true }).first().click();
-    }
+// Waits until the grid rows stay unchanged for 4 checks in a row (about 8 seconds).
+// Returns true if the grid settled.
+async function waitForGridToSettle(page) {
+  const allRows = page.getByRole('row');
+  await allRows.nth(1).waitFor({ state: 'visible', timeout: 60000 }).catch(() => {});
+  let previous = '';
+  let stableChecks = 0;
+  for (let i = 0; i < 40 && stableChecks < 4; i++) {
+    await page.waitForTimeout(2000);
+    const texts = await allRows.allInnerTexts();
+    const snapshot = texts.slice(1).map(t => t.replace(/\s+/g, ' ').trim()).join('|');
+    stableChecks = snapshot === previous ? stableChecks + 1 : 0;
+    previous = snapshot;
   }
-  const item = page.getByText(name, { exact: true }).first();
-  await item.scrollIntoViewIfNeeded();
-  await item.click();
+  return stableChecks >= 4;
 }
 
-// Checks one grid page after its menu item was clicked
-async function checkGridPage(page, { menu, title, expectStatus }) {
+// Clicks one item in the blue menu and makes sure the page really switched
+// AND stayed switched (the app can flip back to its default list while loading).
+// section = 'REPORTING' or 'ADMIN' for items inside those groups.
+// heading = text expected in the white area (default: the menu name).
+// grid    = false for pages that are not a grid (skips the grid settle wait).
+async function clickMenu(page, name, section, heading, grid = true) {
+  const expectedHeading = heading || name;
+  const headingLocator = page.getByText(expectedHeading, { exact: true });
+
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    if (section) {
+      const firstItem = section === 'REPORTING' ? 'By Contracts' : 'Add / Update User';
+      const visible = await page.getByText(firstItem, { exact: true }).first().isVisible();
+      if (!visible) {
+        await page.getByText(section, { exact: true }).first().click();
+      }
+    }
+    const item = page.getByText(name, { exact: true }).first();
+    await item.scrollIntoViewIfNeeded();
+    await item.click();
+
+    // 1. did the page switch? (heading text appears twice: menu item + heading)
+    const switched = await expect(headingLocator)
+      .toHaveCount(2, { timeout: 20000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!switched) {
+      console.log(`[${name}] click did not switch the page (attempt ${attempt} of 4)`);
+      continue;
+    }
+
+    // 2. let the grid settle, then check the page did not flip back
+    if (grid) await waitForGridToSettle(page);
+    if ((await headingLocator.count()) === 2) return;
+    console.log(`[${name}] page flipped back to the default view (attempt ${attempt} of 4)`);
+  }
+
+  console.log(`[${name}] WARNING: the page did not stay switched after 4 clicks`);
+  await page.screenshot({
+    path: `screenshots/${name.replace(/\W+/g, '-')}-switch-failed.png`,
+    fullPage: true,
+  });
+}
+
+// Checks one grid page after its menu item was clicked.
+// expectStatuses (optional): list of statuses every row is allowed to have.
+async function checkGridPage(page, { menu, title, expectStatuses }) {
   const heading = title || menu;
   const allRows = page.getByRole('row');   // header row + data rows
   let dataRowCount = 0;
@@ -44,15 +98,22 @@ async function checkGridPage(page, { menu, title, expectStatus }) {
     await expect(page.getByText('STATUS').first()).toBeVisible({ timeout: 90000 });
   });
 
-  await test.step('Wait for data rows', async () => {
-    // the 2nd row is the first data row (the 1st is the header)
-    await allRows.nth(1).waitFor({ state: 'visible', timeout: 60000 }).catch(() => {});
-    await page.waitForTimeout(2000);
+  await test.step('Wait for the grid to settle', async () => {
+    const settled = await waitForGridToSettle(page);
     dataRowCount = Math.max((await allRows.count()) - 1, 0);
+    console.log(`[${menu}] grid settled: ${settled}`);
+
+    const texts = await allRows.allInnerTexts();
+    texts.slice(1, 4).forEach((t, i) =>
+      console.log(`[${menu}] row ${i + 1}: ${t.replace(/\s+/g, ' ').trim()}`)
+    );
   });
 
   await test.step(`Heading "${heading}" shows in the white area`, async () => {
-    await expect.soft(page.getByText(heading, { exact: true }).last()).toBeVisible();
+    // the text must appear twice: once in the blue menu and once as the page heading
+    const matches = page.getByText(heading, { exact: true });
+    console.log(`[${menu}] places where "${heading}" is shown: ${await matches.count()}`);
+    await expect.soft(matches, `Heading "${heading}" missing in the white area`).toHaveCount(2);
   });
 
   await test.step('Search box, New Invoice and Export are shown', async () => {
@@ -69,7 +130,7 @@ async function checkGridPage(page, { menu, title, expectStatus }) {
     }
   });
 
-  await test.step('Data rows', async () => {
+  await test.step('Data rows and status summary', async () => {
     console.log(`[${menu}] data rows shown on this page: ${dataRowCount}`);
     if (dataRowCount === 0) {
       console.log(`[${menu}] WARNING: no data rows. Compare with the screenshot and the page by hand.`);
@@ -77,26 +138,35 @@ async function checkGridPage(page, { menu, title, expectStatus }) {
         type: 'warning',
         description: `${menu}: no data rows, grid content NOT verified`,
       });
+      return;
+    }
+
+    const texts = (await allRows.allInnerTexts()).slice(1);
+    const counts = {};
+    const outsideAllowed = [];
+    for (const t of texts) {
+      const status = KNOWN_STATUSES.find(s => t.includes(s)) || 'OTHER';
+      counts[status] = (counts[status] || 0) + 1;
+      if (status === 'OTHER') {
+        console.log(`[${menu}] UNKNOWN STATUS ROW: ${t.replace(/\s+/g, ' ').trim()}`);
+      }
+      if (expectStatuses && !expectStatuses.includes(status)) outsideAllowed.push(status);
+    }
+    console.log(`[${menu}] status summary: ${JSON.stringify(counts)}`);
+
+    if (expectStatuses) {
+      console.log(`[${menu}] allowed statuses: ${expectStatuses.join(', ')}`);
+      expect.soft(
+        outsideAllowed.length,
+        `${outsideAllowed.length} row(s) have a status outside: ${expectStatuses.join(', ')}`
+      ).toBe(0);
+    } else {
+      test.info().annotations.push({
+        type: 'note',
+        description: `${menu}: status rule not set yet, summary only: ${JSON.stringify(counts)}`,
+      });
     }
   });
-
-  if (expectStatus) {
-    if (dataRowCount > 0) {
-      await test.step(`Every row shows status "${expectStatus}"`, async () => {
-        const texts = await allRows.allInnerTexts();
-        const dataTexts = texts.slice(1);   // skip the header row
-        const wrong = dataTexts.filter(t => !t.includes(expectStatus));
-        console.log(`[${menu}] rows with status "${expectStatus}": ${dataTexts.length - wrong.length} of ${dataTexts.length}`);
-        expect.soft(wrong.length, `${wrong.length} row(s) do not show "${expectStatus}"`).toBe(0);
-      });
-    } else {
-      console.log(`[${menu}] Status "${expectStatus}" NOT VERIFIED because there were no rows.`);
-      test.info().annotations.push({
-        type: 'warning',
-        description: `${menu}: status "${expectStatus}" not verified (no rows)`,
-      });
-    }
-  }
 
   await test.step('No error messages', async () => {
     await expect.soft(
