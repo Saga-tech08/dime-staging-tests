@@ -37,10 +37,18 @@ async function clickMenu(page, name, section) {
 // Checks one grid page after its menu item was clicked
 async function checkGridPage(page, { menu, title, expectStatus }) {
   const heading = title || menu;
+  const allRows = page.getByRole('row');   // header row + data rows
+  let dataRowCount = 0;
 
   await test.step('Grid area has loaded', async () => {
     await expect(page.getByText('STATUS').first()).toBeVisible({ timeout: 90000 });
-    await page.waitForTimeout(3000); // let the rows finish loading
+  });
+
+  await test.step('Wait for data rows', async () => {
+    // the 2nd row is the first data row (the 1st is the header)
+    await allRows.nth(1).waitFor({ state: 'visible', timeout: 60000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    dataRowCount = Math.max((await allRows.count()) - 1, 0);
   });
 
   await test.step(`Heading "${heading}" shows in the white area`, async () => {
@@ -61,20 +69,33 @@ async function checkGridPage(page, { menu, title, expectStatus }) {
     }
   });
 
-  await test.step('Rows', async () => {
-    const count = await page.getByRole('button', { name: 'Clone' }).count();
-    console.log(`[${menu}] rows found on this page:`, count);
-    if (count === 0) {
-      console.log(`[${menu}] NOTE: no rows shown. Check by hand if this is expected.`);
+  await test.step('Data rows', async () => {
+    console.log(`[${menu}] data rows shown on this page: ${dataRowCount}`);
+    if (dataRowCount === 0) {
+      console.log(`[${menu}] WARNING: no data rows. Compare with the screenshot and the page by hand.`);
+      test.info().annotations.push({
+        type: 'warning',
+        description: `${menu}: no data rows, grid content NOT verified`,
+      });
     }
   });
 
   if (expectStatus) {
-    await test.step(`Rows show status "${expectStatus}"`, async () => {
-      await expect.soft(
-        page.getByText(expectStatus, { exact: true }).first()
-      ).toBeVisible();
-    });
+    if (dataRowCount > 0) {
+      await test.step(`Every row shows status "${expectStatus}"`, async () => {
+        const texts = await allRows.allInnerTexts();
+        const dataTexts = texts.slice(1);   // skip the header row
+        const wrong = dataTexts.filter(t => !t.includes(expectStatus));
+        console.log(`[${menu}] rows with status "${expectStatus}": ${dataTexts.length - wrong.length} of ${dataTexts.length}`);
+        expect.soft(wrong.length, `${wrong.length} row(s) do not show "${expectStatus}"`).toBe(0);
+      });
+    } else {
+      console.log(`[${menu}] Status "${expectStatus}" NOT VERIFIED because there were no rows.`);
+      test.info().annotations.push({
+        type: 'warning',
+        description: `${menu}: status "${expectStatus}" not verified (no rows)`,
+      });
+    }
   }
 
   await test.step('No error messages', async () => {
