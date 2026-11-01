@@ -4,7 +4,14 @@ const HOME_URL =
   'https://ctgovexec.sharepoint.com/sites/DOT-DIME-Test/SitePages/Home.aspx';
 
 // Statuses seen so far (most specific first)
-const KNOWN_STATUSES = ['Initial Review Complete', 'Revision Needed', 'Approved', 'Submitted'];
+const KNOWN_STATUSES = [
+  'Initial Review Complete',
+  'PE Review Complete',
+  'Revision Needed',
+  'Approved',
+  'Rejected',
+  'Submitted',
+];
 
 // Opens the site (retries up to 3 times) and waits until the app is ready
 async function openSite(page) {
@@ -18,6 +25,16 @@ async function openSite(page) {
       await page.waitForTimeout(5000);
     }
   }
+
+  // if the saved login expired, Microsoft sends us to its sign-in page
+  await page.waitForTimeout(5000);
+  if (/login\.microsoftonline\.com|login\.live\.com/.test(page.url())) {
+    throw new Error(
+      'LOGIN EXPIRED: the site sent us to the Microsoft sign-in page. ' +
+      'Save a fresh login with: npx playwright codegen --save-storage=playwright/.auth/user.json "<site url>"'
+    );
+  }
+
   await expect(page.getByText('Home', { exact: true }).first())
     .toBeVisible({ timeout: 90000 });
   // wait for the first grid, so the app can respond to clicks
@@ -45,6 +62,7 @@ async function waitForGridToSettle(page) {
 
 // Clicks one item in the blue menu and makes sure the page really switched
 // AND stayed switched (the app can flip back to its default list while loading).
+// Some pages are slow, so it waits up to 60 seconds before clicking again.
 // section = 'REPORTING' or 'ADMIN' for items inside those groups.
 // heading = text expected in the white area (default: the menu name).
 // grid    = false for pages that are not a grid (skips the grid settle wait).
@@ -52,7 +70,7 @@ async function clickMenu(page, name, section, heading, grid = true) {
   const expectedHeading = heading || name;
   const headingLocator = page.getByText(expectedHeading, { exact: true });
 
-  for (let attempt = 1; attempt <= 4; attempt++) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     if (section) {
       const firstItem = section === 'REPORTING' ? 'By Contracts' : 'Add / Update User';
       const visible = await page.getByText(firstItem, { exact: true }).first().isVisible();
@@ -65,22 +83,24 @@ async function clickMenu(page, name, section, heading, grid = true) {
     await item.click();
 
     // 1. did the page switch? (heading text appears twice: menu item + heading)
+    const started = Date.now();
     const switched = await expect(headingLocator)
-      .toHaveCount(2, { timeout: 20000 })
+      .toHaveCount(2, { timeout: 60000 })
       .then(() => true)
       .catch(() => false);
     if (!switched) {
-      console.log(`[${name}] click did not switch the page (attempt ${attempt} of 4)`);
+      console.log(`[${name}] click did not switch the page within 60 seconds (attempt ${attempt} of 3)`);
       continue;
     }
+    console.log(`[${name}] page switched after about ${Math.round((Date.now() - started) / 1000)} seconds`);
 
     // 2. let the grid settle, then check the page did not flip back
     if (grid) await waitForGridToSettle(page);
     if ((await headingLocator.count()) === 2) return;
-    console.log(`[${name}] page flipped back to the default view (attempt ${attempt} of 4)`);
+    console.log(`[${name}] page flipped back to the default view (attempt ${attempt} of 3)`);
   }
 
-  console.log(`[${name}] WARNING: the page did not stay switched after 4 clicks`);
+  console.log(`[${name}] WARNING: the page did not stay switched after 3 clicks`);
   await page.screenshot({
     path: `screenshots/${name.replace(/\W+/g, '-')}-switch-failed.png`,
     fullPage: true,
@@ -98,7 +118,10 @@ async function checkGridPage(page, { menu, title, expectStatuses }) {
     await expect(page.getByText('STATUS').first()).toBeVisible({ timeout: 90000 });
   });
 
-  await test.step('Wait for the grid to settle', async () => {
+  await test.step('Wait for the right page, then for the grid to settle', async () => {
+    // make sure the page switched BEFORE reading any rows
+    await expect(page.getByText(heading, { exact: true })).toHaveCount(2, { timeout: 60000 })
+      .catch(() => console.log(`[${menu}] WARNING: heading "${heading}" not shown twice before reading rows`));
     const settled = await waitForGridToSettle(page);
     dataRowCount = Math.max((await allRows.count()) - 1, 0);
     console.log(`[${menu}] grid settled: ${settled}`);
