@@ -96,9 +96,17 @@ async function checkReportingPage(page, { menu, heading, texts = [], placeholder
   });
 
   await test.step('No error messages', async () => {
-    await expect.soft(
-      page.getByText(/something went wrong|failed to load|error/i)
-    ).toHaveCount(0);
+    const errorRe = /something went wrong|failed to load|error/i;
+    // find every piece of text that matches, and say whether it sits inside the grid data
+    const found = await page.getByText(errorRe).evaluateAll(els => els.map(el => ({
+      text: (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200),
+      inGrid: !!el.closest('[role="row"], [role="gridcell"], tr, td'),
+    })));
+    found.forEach(f =>
+      console.log(`[${menu}] text matching the error check (${f.inGrid ? 'inside the grid' : 'OUTSIDE the grid'}): ${f.text}`));
+    // matches inside the grid are data (for example a vendor name), only a match outside is an error message
+    const outside = found.filter(f => !f.inGrid);
+    expect.soft(outside.length, `Error text shown on the page: ${outside.map(f => f.text).join(' | ')}`).toBe(0);
   });
 
   await test.step('Screenshot as evidence', async () => {
