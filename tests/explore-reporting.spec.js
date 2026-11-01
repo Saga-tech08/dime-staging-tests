@@ -2,7 +2,7 @@ const { test } = require('@playwright/test');
 const { openSite } = require('./helpers');
 
 // The REPORTING page to look at
-const MENU = 'By Status';
+const MENU = 'By ID';
 
 // READ ONLY: clicks only the menu item, never types and never clicks buttons
 test(`Explore REPORTING page: ${MENU}`, async ({ page }) => {
