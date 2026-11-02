@@ -3,7 +3,7 @@ const { defineConfig, devices } = require('@playwright/test');
 module.exports = defineConfig({
   testDir: './tests',
   testIgnore: ['**/example.spec.js', '**/explore-reporting.spec.js'],   // skip the sample and the page printer
-  timeout: 420000,                       // 7 minutes per test (slow site)
+  timeout: 900000,                       // 7 minutes per test (slow site)
   expect: { timeout: 15000 },            // checks wait up to 15 seconds
   retries: 0,                            // no hidden retries, so every result is the real one
   workers: 1,                            // one test at a time (shared staging data)

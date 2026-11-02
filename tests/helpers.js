@@ -7,13 +7,26 @@ const HOME_URL =
 const KNOWN_STATUSES = [
   'Initial Review Complete',
   'PE Review Complete',
+  'PM Review Complete',
+  'Revision Submitted',
   'Revision Needed',
   'Approved',
   'Rejected',
   'Submitted',
 ];
 
-// Opens the site (retries up to 3 times) and waits until the app is ready
+// Stops with a clear message if the saved login expired
+function failIfLoginExpired(page) {
+  if (/login\.microsoftonline\.com|login\.live\.com/.test(page.url())) {
+    throw new Error(
+      'LOGIN EXPIRED: the site sent us to the Microsoft sign-in page. ' +
+      'Save a fresh login with: npx playwright codegen --save-storage=playwright/.auth/user.json "<site url>"'
+    );
+  }
+}
+
+// Opens the site (retries up to 3 times) and waits until the app is ready.
+// If the menu does not appear, it reloads the page once.
 async function openSite(page) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -26,19 +39,22 @@ async function openSite(page) {
     }
   }
 
-  // if the saved login expired, Microsoft sends us to its sign-in page
   await page.waitForTimeout(5000);
-  if (/login\.microsoftonline\.com|login\.live\.com/.test(page.url())) {
-    throw new Error(
-      'LOGIN EXPIRED: the site sent us to the Microsoft sign-in page. ' +
-      'Save a fresh login with: npx playwright codegen --save-storage=playwright/.auth/user.json "<site url>"'
-    );
-  }
+  failIfLoginExpired(page);
 
-  await expect(page.getByText('Home', { exact: true }).first())
-    .toBeVisible({ timeout: 90000 });
-  // wait for the first grid, so the app can respond to clicks
-  await page.getByText('STATUS').first()
+  const home = page.getByText('Home', { exact: true }).first();
+  const menuShown = await home.waitFor({ state: 'visible', timeout: 60000 })
+    .then(() => true).catch(() => false);
+  if (!menuShown) {
+    console.log('The blue menu did not appear within 60 seconds, reloading the page once');
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+    await page.waitForTimeout(5000);
+    failIfLoginExpired(page);
+  }
+  await expect(home).toBeVisible({ timeout: 90000 });
+
+  // wait for the first data row of the opening grid, so the app can respond to clicks
+  await page.getByRole('row').nth(1)
     .waitFor({ state: 'visible', timeout: 90000 }).catch(() => {});
   await page.waitForTimeout(3000);
 }
@@ -60,17 +76,41 @@ async function waitForGridToSettle(page) {
   return stableChecks >= 4;
 }
 
+// Checks that column headers exist. It looks for real column headers first,
+// because plain text such as "STATUS" would also match the menu item "By Status".
+async function checkColumns(page, menu, columns) {
+  for (const col of columns) {
+    const header = page.getByRole('columnheader', { name: new RegExp(col, 'i') });
+    const viaRole = await header.count();
+    if (viaRole === 0) {
+      console.log(`[${menu}] note: no column header found by role for "${col}", using plain text (could also match the menu)`);
+    }
+    const target = viaRole > 0 ? header.first() : page.getByText(col).first();
+    await expect.soft(target, `Column ${col}`).toBeVisible();
+  }
+}
+
 // Clicks one item in the blue menu and makes sure the page really switched
 // AND stayed switched (the app can flip back to its default list while loading).
-// Some pages are slow, so it waits up to 60 seconds before clicking again.
-// section = 'REPORTING' or 'ADMIN' for items inside those groups.
-// heading = text expected in the white area (default: the menu name).
-// grid    = false for pages that are not a grid (skips the grid settle wait).
-async function clickMenu(page, name, section, heading, grid = true) {
+// Attempt 1: click and wait. Attempt 2: click again WITHOUT reloading (a slow page may
+// still be loading). Attempt 3: reload the whole site, then click again.
+// section     = 'REPORTING' or 'ADMIN' for items inside those groups.
+// heading     = text expected in the white area (default: the menu name).
+// grid        = false for pages that are not a grid (skips the grid settle wait).
+// waitSeconds = how long to wait for the page to switch per attempt (default 90).
+async function clickMenu(page, name, section, heading, grid = true, waitSeconds = 90) {
   const expectedHeading = heading || name;
+  const expectedCount = expectedHeading === name ? 2 : 1;
   const headingLocator = page.getByText(expectedHeading, { exact: true });
 
   for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt === 3) {
+      console.log(`[${name}] reloading the site before the last attempt`);
+      await openSite(page);
+    } else if (attempt === 2) {
+      console.log(`[${name}] clicking again without reloading (attempt 2 of 3)`);
+    }
+
     if (section) {
       const firstItem = section === 'REPORTING' ? 'By Contracts' : 'Add / Update User';
       const visible = await page.getByText(firstItem, { exact: true }).first().isVisible();
@@ -82,32 +122,36 @@ async function clickMenu(page, name, section, heading, grid = true) {
     await item.scrollIntoViewIfNeeded();
     await item.click();
 
-    // 1. did the page switch? (heading text appears twice: menu item + heading)
+    // 1. did the page switch?
     const started = Date.now();
     const switched = await expect(headingLocator)
-      .toHaveCount(2, { timeout: 60000 })
+      .toHaveCount(expectedCount, { timeout: waitSeconds * 1000 })
       .then(() => true)
       .catch(() => false);
     if (!switched) {
-      console.log(`[${name}] click did not switch the page within 60 seconds (attempt ${attempt} of 3)`);
+      console.log(`[${name}] click did not switch the page within ${waitSeconds} seconds (attempt ${attempt} of 3)`);
       continue;
     }
-    console.log(`[${name}] page switched after about ${Math.round((Date.now() - started) / 1000)} seconds`);
+    console.log(`[${name}] page switched after about ${Math.round((Date.now() - started) / 1000)} seconds (attempt ${attempt})`);
 
-    // 2. let the grid settle, then check the page did not flip back
-    if (grid) await waitForGridToSettle(page);
-    if ((await headingLocator.count()) === 2) return;
+    // 2. let the content settle, then check the page did not flip back
+    if (grid) {
+      await waitForGridToSettle(page);
+    } else {
+      await page.waitForTimeout(3000);
+    }
+    if ((await headingLocator.count()) === expectedCount) return;
     console.log(`[${name}] page flipped back to the default view (attempt ${attempt} of 3)`);
   }
 
-  console.log(`[${name}] WARNING: the page did not stay switched after 3 clicks`);
+  console.log(`[${name}] WARNING: the page did not stay switched after 3 attempts`);
   await page.screenshot({
     path: `screenshots/${name.replace(/\W+/g, '-')}-switch-failed.png`,
     fullPage: true,
   });
 }
 
-// Checks one grid page after its menu item was clicked.
+// Checks one invoice grid page after its menu item was clicked.
 // expectStatuses (optional): list of statuses every row is allowed to have.
 async function checkGridPage(page, { menu, title, expectStatuses }) {
   const heading = title || menu;
@@ -115,7 +159,7 @@ async function checkGridPage(page, { menu, title, expectStatuses }) {
   let dataRowCount = 0;
 
   await test.step('Grid area has loaded', async () => {
-    await expect(page.getByText('STATUS').first()).toBeVisible({ timeout: 90000 });
+    await allRows.nth(1).waitFor({ state: 'visible', timeout: 60000 }).catch(() => {});
   });
 
   await test.step('Wait for the right page, then for the grid to settle', async () => {
@@ -146,11 +190,8 @@ async function checkGridPage(page, { menu, title, expectStatuses }) {
   });
 
   await test.step('Grid column headers', async () => {
-    const columns = ['CONTRA', 'VENDOR', 'PROJECT', 'INVOICE', 'DESCRIPT',
-                     'AMOUNT', 'SUBMITT', 'START DA', 'END DATE', 'STATUS'];
-    for (const col of columns) {
-      await expect.soft(page.getByText(col).first(), `Column ${col}`).toBeVisible();
-    }
+    await checkColumns(page, menu, ['CONTRA', 'VENDOR', 'PROJECT', 'INVOICE', 'DESCRIPT',
+                                    'AMOUNT', 'SUBMITT', 'START DA', 'END DATE', 'STATUS']);
   });
 
   await test.step('Data rows and status summary', async () => {
@@ -192,9 +233,16 @@ async function checkGridPage(page, { menu, title, expectStatuses }) {
   });
 
   await test.step('No error messages', async () => {
-    await expect.soft(
-      page.getByText(/something went wrong|failed to load|error/i)
-    ).toHaveCount(0);
+    const errorRe = /something went wrong|failed to load|error/i;
+    // text inside the grid is invoice data (for example a description), only a match outside is an error message
+    const found = await page.getByText(errorRe).evaluateAll(els => els.map(el => ({
+      text: (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200),
+      inGrid: !!el.closest('[role="row"], [role="gridcell"], tr, td'),
+    })));
+    found.forEach(f =>
+      console.log(`[${menu}] text matching the error check (${f.inGrid ? 'inside the grid' : 'OUTSIDE the grid'}): ${f.text}`));
+    const outside = found.filter(f => !f.inGrid);
+    expect.soft(outside.length, `Error text shown on the page: ${outside.map(f => f.text).join(' | ')}`).toBe(0);
   });
 
   await test.step('Screenshot as evidence', async () => {
