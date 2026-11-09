@@ -6,5 +6,10 @@
     "@playwright/test": "^1.64.1",
     "@types/node": "^26.6.6"
   },
-  "scripts": {}
+  "scripts": {
+  "login": "playwright codegen --save-storage=playwright/.auth/user.json \"https://ctgovexec.sharepoint.com/sites/DOT-DIME-Test/SitePages/Home.aspx\"",
+  "test:invoices": "playwright test tests/DimeApp/InvoicePages.test.js",
+  "test:reporting": "playwright test tests/DimeApp/ReportingSection.test.js",
+  "test:admin": "playwright test tests/DimeApp/AdminSection.test.js"
+}
 }
